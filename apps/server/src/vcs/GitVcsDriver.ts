@@ -560,21 +560,47 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
   const vcsProcess = yield* VcsProcess.VcsProcess;
   const crypto = yield* Crypto.Crypto;
   const hostPlatform = yield* HostProcess.Platform;
+  const probeRepository = Effect.fn("GitVcsDriver.probeRepository")(
+    function* (
+      cwd: string,
+      args: ReadonlyArray<string>,
+      operation: string,
+      maxOutputBytes: number,
+    ) {
+      const result = yield* gitCommand(vcsProcess, operation, cwd, args, {
+        allowNonZeroExit: true,
+        env: { LC_ALL: "C", LANGUAGE: "C" },
+        timeoutMs: 5_000,
+        maxOutputBytes,
+      });
+      if (result.exitCode === 0) return result;
+      if (
+        result.stderr
+          .split(/\r?\n/)
+          .some(
+            (line) =>
+              line === "fatal: not a git repository (or any of the parent directories): .git" ||
+              /^fatal: not a git repository \(or any parent up to mount point .+\)$/.test(line),
+          )
+      ) {
+        return null;
+      }
+      return yield* VcsProcessExitError.fromProcessExit(
+        { operation, command: "git", cwd },
+        result,
+        "command-failed",
+      );
+    },
+    Effect.catchIf(isMissingExecutable, () => Effect.succeed(null)),
+  );
+
   const isInsideWorkTree: VcsDriver.VcsDriver["Service"]["isInsideWorkTree"] = (cwd) =>
-    gitCommand(
-      vcsProcess,
-      "GitVcsDriver.isInsideWorkTree",
+    probeRepository(
       cwd,
       ["rev-parse", "--is-inside-work-tree"],
-      {
-        allowNonZeroExit: true,
-        timeoutMs: 5_000,
-        maxOutputBytes: 4_096,
-      },
-    ).pipe(
-      Effect.map((result) => result.exitCode === 0 && result.stdout.trim() === "true"),
-      Effect.catchIf(isMissingExecutable, () => Effect.succeed(false)),
-    );
+      "GitVcsDriver.isInsideWorkTree",
+      4_096,
+    ).pipe(Effect.map((result) => result?.stdout.trim() === "true"));
 
   const execute: VcsDriver.VcsDriver["Service"]["execute"] = (input) =>
     gitCommand(vcsProcess, input.operation, input.cwd, input.args, {
@@ -593,18 +619,13 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     "detectRepository",
   )(function* (cwd) {
     // One spawn answers all three; outside a work tree it exits non-zero or prints "false".
-    const result = yield* gitCommand(
-      vcsProcess,
-      "GitVcsDriver.detectRepository",
+    const result = yield* probeRepository(
       cwd,
       ["rev-parse", "--is-inside-work-tree", "--show-toplevel", "--git-common-dir"],
-      {
-        allowNonZeroExit: true,
-        timeoutMs: 5_000,
-        maxOutputBytes: 16_384,
-      },
-    ).pipe(Effect.catchIf(isMissingExecutable, () => Effect.succeed(null)));
-    if (result === null || result.exitCode !== 0) return null;
+      "GitVcsDriver.detectRepository",
+      16_384,
+    );
+    if (result === null) return null;
     const lines = result.stdout.replace(/\r?\n$/u, "").split(/\r?\n/u);
     if (lines[0]?.trim() !== "true") return null;
     // A newline inside a path breaks the line framing; ask for each path on its own.
@@ -774,46 +795,42 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       maxOutputBytes: 64 * 1024,
     }).pipe(Effect.asVoid);
 
-  const resolveHeadCommit = (cwd: string) =>
-    execute({
-      operation: "GitVcsDriver.checkpoints.resolveHeadCommit",
+  const resolveCommit = Effect.fn("GitVcsDriver.checkpoints.resolveCommit")(function* (
+    cwd: string,
+    ref: string,
+    operation: string,
+    env?: NodeJS.ProcessEnv,
+  ) {
+    const result = yield* execute({
+      operation,
       cwd,
-      args: ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-      allowNonZeroExit: true,
-    }).pipe(
-      Effect.map((result) => {
-        if (result.exitCode !== 0) {
-          return null;
-        }
-        const commit = result.stdout.trim();
-        return commit.length > 0 ? commit : null;
-      }),
-    );
-
-  const hasHeadCommit = (cwd: string, env?: NodeJS.ProcessEnv) =>
-    execute({
-      operation: "GitVcsDriver.checkpoints.hasHeadCommit",
-      cwd,
-      args: ["rev-parse", "--verify", "HEAD"],
+      args: ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
       allowNonZeroExit: true,
       ...(env !== undefined ? { env } : {}),
-    }).pipe(Effect.map((result) => result.exitCode === 0));
+    });
+    // Quiet verification exits 1 for an unresolved ref; fatal Git failures use other exits.
+    if (result.exitCode === 1) return null;
+    if (result.exitCode !== 0) {
+      return yield* VcsProcessExitError.fromProcessExit(
+        { operation, command: "git", cwd },
+        result,
+        "command-failed",
+      );
+    }
+    const commit = result.stdout.trim();
+    return commit.length > 0 ? commit : null;
+  });
+
+  const resolveHeadCommit = (cwd: string) =>
+    resolveCommit(cwd, "HEAD", "GitVcsDriver.checkpoints.resolveHeadCommit");
+
+  const hasHeadCommit = (cwd: string, env?: NodeJS.ProcessEnv) =>
+    resolveCommit(cwd, "HEAD", "GitVcsDriver.checkpoints.hasHeadCommit", env).pipe(
+      Effect.map((commit) => commit !== null),
+    );
 
   const resolveCheckpointCommit = (cwd: string, checkpointRef: string) =>
-    execute({
-      operation: "GitVcsDriver.checkpoints.resolveCheckpointCommit",
-      cwd,
-      args: ["rev-parse", "--verify", "--quiet", `${checkpointRef}^{commit}`],
-      allowNonZeroExit: true,
-    }).pipe(
-      Effect.map((result) => {
-        if (result.exitCode !== 0) {
-          return null;
-        }
-        const commit = result.stdout.trim();
-        return commit.length > 0 ? commit : null;
-      }),
-    );
+    resolveCommit(cwd, checkpointRef, "GitVcsDriver.checkpoints.resolveCheckpointCommit");
 
   // Git reports relative paths from the physical cwd, which can differ from a symlink.
   const resolveGitCommonDir = Effect.fn("GitVcsDriver.resolveGitCommonDir")(function* (

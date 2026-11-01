@@ -129,6 +129,7 @@ export interface CheckpointServiceV2Shape {
     readonly appRunOrdinal: number | null;
     readonly capturedAt: DateTime.Utc;
     readonly forceMissing?: boolean;
+    readonly compareWithPrevious?: boolean;
   }) => Effect.Effect<OrchestrationV2Checkpoint, CheckpointServiceV2Error>;
   readonly restore: (input: {
     readonly scope: OrchestrationV2CheckpointScope;
@@ -210,6 +211,7 @@ function makeCheckpoint(input: {
   readonly ref: CheckpointRef;
   readonly status: OrchestrationV2Checkpoint["status"];
   readonly files: OrchestrationV2Checkpoint["files"];
+  readonly summaryStatus?: OrchestrationV2Checkpoint["summaryStatus"];
   readonly capturedAt: DateTime.Utc;
 }): OrchestrationV2Checkpoint {
   return {
@@ -224,6 +226,7 @@ function makeCheckpoint(input: {
     ref: input.ref,
     status: input.status,
     files: input.files,
+    ...(input.summaryStatus === undefined ? {} : { summaryStatus: input.summaryStatus }),
     capturedAt: input.capturedAt,
   };
 }
@@ -244,14 +247,11 @@ export const layer: Layer.Layer<
     const withWorkspaceLock = <A, E, R>(cwd: string, effect: Effect.Effect<A, E, R>) =>
       workspaceLocks.withLock(cwd, effect);
 
-    const isGitCheckpointable = (cwd: string) =>
-      checkpointStore.isGitRepository(cwd).pipe(Effect.orElseSucceed(() => false));
-
     const captureBaseline: CheckpointServiceV2Shape["captureBaseline"] = (input) =>
       withWorkspaceLock(
         input.scope.cwd,
         Effect.gen(function* () {
-          if (!(yield* isGitCheckpointable(input.scope.cwd))) {
+          if (!(yield* checkpointStore.isGitRepository(input.scope.cwd))) {
             return;
           }
 
@@ -302,24 +302,27 @@ export const layer: Layer.Layer<
               scopeId: input.scope.id,
               ordinalWithinScope: input.ordinalWithinScope,
             });
-            const checkpointable =
-              input.forceMissing !== true && (yield* isGitCheckpointable(input.scope.cwd));
-            const available = checkpointable
-              ? yield* checkpointStore
-                  .hasCheckpointRef({
-                    cwd: input.scope.cwd,
-                    checkpointRef,
-                  })
-                  .pipe(
-                    Effect.catch((cause) =>
-                      Effect.logWarning("orchestration V2 baseline ref lookup failed", {
-                        scopeId: input.scope.id,
-                        checkpointRef,
-                        cause: String(cause),
-                      }).pipe(Effect.as(false)),
-                    ),
-                  )
-              : false;
+            const status = yield* Effect.gen(function* () {
+              if (
+                input.forceMissing === true ||
+                !(yield* checkpointStore.isGitRepository(input.scope.cwd))
+              ) {
+                return "missing" as const;
+              }
+              const available = yield* checkpointStore.hasCheckpointRef({
+                cwd: input.scope.cwd,
+                checkpointRef,
+              });
+              return available ? ("ready" as const) : ("missing" as const);
+            }).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration V2 baseline checkpoint lookup failed", {
+                  scopeId: input.scope.id,
+                  checkpointRef,
+                  cause,
+                }).pipe(Effect.as("error" as const)),
+              ),
+            );
             return makeCheckpoint({
               id: checkpointId,
               scope: input.scope,
@@ -329,7 +332,7 @@ export const layer: Layer.Layer<
               ordinalWithinScope: input.ordinalWithinScope,
               appRunOrdinal: null,
               ref: checkpointRef,
-              status: available ? "ready" : "missing",
+              status,
               files: [],
               capturedAt: input.scope.createdAt,
             });
@@ -368,40 +371,30 @@ export const layer: Layer.Layer<
             ordinalWithinScope: Math.max(0, input.ordinalWithinScope - 1),
           });
 
-          if (input.forceMissing === true || !(yield* isGitCheckpointable(input.scope.cwd))) {
-            return makeCheckpoint({
-              id: checkpointId,
-              scope: input.scope,
-              runId: input.runId,
-              nodeId: input.nodeId,
-              parentCheckpointId,
-              ordinalWithinScope: input.ordinalWithinScope,
-              appRunOrdinal: input.appRunOrdinal,
-              ref: checkpointRef,
-              status: "missing",
-              files: [],
-              capturedAt: input.capturedAt,
-            });
-          }
-
-          const captureStatus = yield* checkpointStore
-            .captureCheckpoint({
+          const captureStatus = yield* Effect.gen(function* () {
+            if (
+              input.forceMissing === true ||
+              !(yield* checkpointStore.isGitRepository(input.scope.cwd))
+            ) {
+              return "missing" as const;
+            }
+            yield* checkpointStore.captureCheckpoint({
               cwd: input.scope.cwd,
               checkpointRef,
-            })
-            .pipe(
-              Effect.as("ready" as const),
-              Effect.catchTags({
-                VcsUnsupportedOperationError: () => Effect.succeed("missing" as const),
-              }),
-              Effect.catch((cause) =>
-                Effect.logWarning("orchestration V2 checkpoint capture failed", {
-                  scopeId: input.scope.id,
-                  checkpointRef,
-                  cause: String(cause),
-                }).pipe(Effect.as("error" as const)),
-              ),
-            );
+            });
+            return "ready" as const;
+          }).pipe(
+            Effect.catchTags({
+              VcsUnsupportedOperationError: () => Effect.succeed("missing" as const),
+            }),
+            Effect.catch((cause) =>
+              Effect.logWarning("orchestration V2 checkpoint capture failed", {
+                scopeId: input.scope.id,
+                checkpointRef,
+                cause,
+              }).pipe(Effect.as("error" as const)),
+            ),
+          );
 
           if (captureStatus !== "ready") {
             return makeCheckpoint({
@@ -419,63 +412,55 @@ export const layer: Layer.Layer<
             });
           }
 
-          const previousExists = yield* checkpointStore
-            .hasCheckpointRef({
+          const summary = yield* Effect.gen(function* () {
+            if (input.compareWithPrevious === false)
+              return { status: "missing" as const, files: [] };
+            const previousExists = yield* checkpointStore.hasCheckpointRef({
               cwd: input.scope.cwd,
               checkpointRef: previousCheckpointRef,
-            })
-            .pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("orchestration V2 previous checkpoint ref lookup failed", {
-                  scopeId: input.scope.id,
-                  checkpointRef: previousCheckpointRef,
-                  cause: String(cause),
-                }).pipe(Effect.as(false)),
-              ),
-            );
-          const refs = {
-            cwd: input.scope.cwd,
-            fromCheckpointRef: previousCheckpointRef,
-            toCheckpointRef: checkpointRef,
-          };
-          // A pull or rebase can change thousands of files the turn did not write.
-          const files = previousExists
-            ? yield* Effect.all([
-                checkpointStore.diffCheckpoints({
-                  ...refs,
-                  fallbackFromToHead: false,
-                  ignoreWhitespace: false,
-                  format: "numstat",
-                }),
-                checkpointStore.listAuthoredPaths(refs).pipe(
-                  Effect.catch((cause) =>
-                    Effect.logWarning("orchestration V2 checkpoint authored paths failed", {
-                      scopeId: input.scope.id,
-                      checkpointRef,
-                      cause: String(cause),
-                    }).pipe(Effect.as(null)),
-                  ),
-                ),
-              ]).pipe(
-                Effect.map(([diff, authoredPaths]) =>
-                  parseTurnDiffFilesFromNumstat(diff)
-                    .filter((file) => !isGitImport(file, authoredPaths))
-                    .map((file) => ({
-                      path: file.path,
-                      kind: "modified",
-                      additions: file.additions,
-                      deletions: file.deletions,
-                    })),
-                ),
+            });
+            if (!previousExists) return { status: "missing" as const, files: [] };
+            const refs = {
+              cwd: input.scope.cwd,
+              fromCheckpointRef: previousCheckpointRef,
+              toCheckpointRef: checkpointRef,
+            };
+            // A pull or rebase can change thousands of files the turn did not write.
+            const [diff, authoredPaths] = yield* Effect.all([
+              checkpointStore.diffCheckpoints({
+                ...refs,
+                fallbackFromToHead: false,
+                ignoreWhitespace: false,
+                format: "numstat",
+              }),
+              checkpointStore.listAuthoredPaths(refs).pipe(
                 Effect.catch((cause) =>
-                  Effect.logWarning("orchestration V2 checkpoint diff summary failed", {
+                  Effect.logWarning("orchestration V2 checkpoint authored paths failed", {
                     scopeId: input.scope.id,
                     checkpointRef,
-                    cause: String(cause),
-                  }).pipe(Effect.as([])),
+                    cause,
+                  }).pipe(Effect.as(null)),
                 ),
-              )
-            : [];
+              ),
+            ]);
+            const files = parseTurnDiffFilesFromNumstat(diff)
+              .filter((file) => !isGitImport(file, authoredPaths))
+              .map((file) => ({
+                path: file.path,
+                kind: "modified",
+                additions: file.additions,
+                deletions: file.deletions,
+              }));
+            return { status: "ready" as const, files };
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("orchestration V2 checkpoint diff summary failed", {
+                scopeId: input.scope.id,
+                checkpointRef,
+                cause,
+              }).pipe(Effect.as({ status: "error" as const, files: [] })),
+            ),
+          );
 
           return makeCheckpoint({
             id: checkpointId,
@@ -487,7 +472,8 @@ export const layer: Layer.Layer<
             appRunOrdinal: input.appRunOrdinal,
             ref: checkpointRef,
             status: "ready",
-            files,
+            files: summary.files,
+            summaryStatus: summary.status,
             capturedAt: input.capturedAt,
           });
         }),

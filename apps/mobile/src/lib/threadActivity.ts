@@ -1948,6 +1948,7 @@ function checkpointSummariesEqual(
       summary.checkpointRef === other.checkpointRef &&
       summary.completedAt === other.completedAt &&
       summary.status === other.status &&
+      summary.summaryStatus === other.summaryStatus &&
       summary.files === other.files &&
       summary.assistantMessageId === other.assistantMessageId
     );

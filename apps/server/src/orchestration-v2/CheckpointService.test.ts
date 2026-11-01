@@ -8,6 +8,7 @@ import {
   ThreadId,
   type OrchestrationV2CheckpointScope,
   VcsProcessTimeoutError,
+  VcsProcessExitError,
   VcsUnsupportedOperationError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -17,6 +18,78 @@ import * as Layer from "effect/Layer";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+
+it.effect("records repository probe failures as errors and recovers on the next capture", () =>
+  Effect.gen(function* () {
+    const scope: OrchestrationV2CheckpointScope = {
+      id: CheckpointScopeId.make("checkpoint-scope:probe-failure"),
+      threadId: ThreadId.make("thread:probe-failure"),
+      runId: RunId.make("run:probe-failure:1"),
+      nodeId: NodeId.make("node:probe-failure:1"),
+      parentScopeId: null,
+      providerThreadId: ProviderThreadId.make("provider-thread:probe-failure"),
+      kind: "root_run",
+      ordinalWithinParent: 0,
+      advancesAppRunCount: true,
+      cwd: "/repo",
+      createdAt: DateTime.makeUnsafe("2026-11-01T00:00:00.000Z"),
+    };
+    const probeError = new VcsProcessExitError({
+      operation: "GitVcsDriver.isInsideWorkTree",
+      command: "git",
+      cwd: scope.cwd,
+      exitCode: 128,
+      detail: "Process exited with a non-zero status.",
+    });
+    let probeFails = true;
+    let captures = 0;
+    const layerTest = CheckpointService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          Layer.mock(CheckpointStore.CheckpointStore)({
+            isGitRepository: () => (probeFails ? Effect.fail(probeError) : Effect.succeed(true)),
+            hasCheckpointRef: () => Effect.succeed(false),
+            captureCheckpoint: () =>
+              Effect.sync(() => {
+                captures += 1;
+              }),
+          }),
+        ),
+      ),
+      Layer.provideMerge(NodeCrypto.layer),
+    );
+    yield* Effect.gen(function* () {
+      const checkpoints = yield* CheckpointService.CheckpointServiceV2;
+      const baseline = yield* Effect.result(
+        checkpoints.captureBaseline({ scope, ordinalWithinScope: 0 }),
+      );
+      assert.strictEqual(baseline._tag, "Failure");
+      if (baseline._tag === "Failure") assert.strictEqual(baseline.failure.cause, probeError);
+      const materialized = yield* checkpoints.materializeBaselineCheckpoint({
+        scope,
+        ordinalWithinScope: 0,
+      });
+      assert.strictEqual(materialized.status, "error");
+      const capture = () =>
+        checkpoints.capture({
+          scope,
+          ordinalWithinScope: 1,
+          runId: scope.runId!,
+          nodeId: scope.nodeId!,
+          appRunOrdinal: 1,
+          capturedAt: scope.createdAt,
+        });
+      assert.strictEqual((yield* capture()).status, "error");
+      assert.strictEqual(captures, 0);
+      probeFails = false;
+      const recovered = yield* capture();
+      assert.strictEqual(recovered.status, "ready");
+      assert.strictEqual(recovered.summaryStatus, "missing");
+      assert.strictEqual(captures, 1);
+    }).pipe(Effect.provide(layerTest));
+  }),
+);
 
 it.effect(
   "skips unsupported baseline and turn checkpoints without swallowing capture failures",

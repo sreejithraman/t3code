@@ -250,12 +250,29 @@ const ProjectionCheckpointContext = Schema.Struct({
 export type ProjectionCheckpointContext = typeof ProjectionCheckpointContext.Type;
 const decodeCheckpointContext = Schema.decodeUnknownEffect(ProjectionCheckpointContext);
 
+const CheckpointCapturePredecessor = OrchestrationV2CheckpointJsonSchema.mapFields(
+  ({ id, runId, nodeId, parentCheckpointId, appRunOrdinal, ref, summaryStatus, capturedAt }) => ({
+    id,
+    runId,
+    nodeId,
+    parentCheckpointId,
+    appRunOrdinal,
+    ref,
+    summaryStatus,
+    capturedAt,
+  }),
+);
+const decodeCheckpointCapturePredecessor = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(CheckpointCapturePredecessor),
+);
+
 export interface ProjectionCheckpointCaptureContext {
   readonly run: OrchestrationV2Run | undefined;
   readonly rootNode: OrchestrationV2ExecutionNode | undefined;
   readonly scope: OrchestrationV2CheckpointScope | undefined;
   readonly providerThread: OrchestrationV2ProviderThread | undefined;
   readonly readyCheckpointOrdinals: ReadonlyArray<number>;
+  readonly previousCheckpoint?: typeof CheckpointCapturePredecessor.Type;
   /** Side chats share their parent's worktree and never snapshot it. */
   readonly sideChat: boolean;
 }
@@ -5104,7 +5121,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               runRows[0] === undefined
                 ? undefined
                 : yield* decodeRunPayload(runRows[0].payload_json);
-            const [nodeRows, scopeRows, providerRows, readyRows] = yield* Effect.all([
+            const [nodeRows, scopeRows, providerRows, readyRows, previousRows] = yield* Effect.all([
               sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_nodes
             WHERE thread_id = ${threadId} AND node_id = ${run?.rootNodeId ?? null}`,
               sql<PayloadRow>`SELECT payload_json FROM orchestration_v2_projection_checkpoint_scopes
@@ -5117,6 +5134,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               sql<{ readonly ordinal: number }>`SELECT ordinal_within_scope AS ordinal
             FROM orchestration_v2_projection_checkpoints
             WHERE thread_id = ${threadId} AND scope_id = ${target.scopeId} AND status = 'ready'`,
+              sql<PayloadRow>`SELECT json_remove(checkpoint.payload_json, '$.files', '$.filesTotal') AS payload_json
+            FROM orchestration_v2_projection_checkpoints AS checkpoint
+            JOIN orchestration_v2_projection_runs AS predecessor
+              ON predecessor.run_id = checkpoint.run_id AND predecessor.thread_id = checkpoint.thread_id
+            WHERE checkpoint.thread_id = ${threadId} AND checkpoint.scope_id = ${target.scopeId}
+              AND checkpoint.ordinal_within_scope = ${run === undefined ? null : Math.max(0, run.ordinal - 1)}
+              AND checkpoint.status IN ('error', 'missing')
+              AND predecessor.status IN ('completed', 'interrupted', 'cancelled', 'failed')`,
             ]);
             return {
               run,
@@ -5132,6 +5157,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 providerRows[0] === undefined
                   ? undefined
                   : yield* decodeProviderThreadPayload(providerRows[0].payload_json),
+              ...(previousRows[0] === undefined
+                ? {}
+                : {
+                    previousCheckpoint: yield* decodeCheckpointCapturePredecessor(
+                      previousRows[0].payload_json,
+                    ),
+                  }),
               readyCheckpointOrdinals: readyRows.map(({ ordinal }) => ordinal),
               sideChat: threadRows[0].side_chat === 1,
             };

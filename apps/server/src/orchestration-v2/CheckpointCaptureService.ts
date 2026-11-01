@@ -65,8 +65,15 @@ export const layer: Layer.Layer<
       readonly runId: RunId;
       readonly scopeId: CheckpointScopeId;
     }) {
-      const { run, rootNode, scope, providerThread, readyCheckpointOrdinals, sideChat } =
-        yield* projections.getCheckpointCaptureContext(input.threadId, input);
+      const {
+        run,
+        rootNode,
+        scope,
+        providerThread,
+        readyCheckpointOrdinals,
+        previousCheckpoint,
+        sideChat,
+      } = yield* projections.getCheckpointCaptureContext(input.threadId, input);
       // Stopped runs remain terminal; their checkpoint is the next message's rollback point.
       const stopped = run?.status === "interrupted" || run?.status === "cancelled";
 
@@ -111,13 +118,23 @@ export const layer: Layer.Layer<
               ordinalWithinScope: 0,
               forceMissing: sideChat,
             });
-      const baselineCheckpoint = hasReadyCheckpoint(baselineOrdinalWithinScope)
+      let baselineCheckpoint = hasReadyCheckpoint(baselineOrdinalWithinScope)
         ? null
         : yield* checkpoints.materializeBaselineCheckpoint({
             scope,
             ordinalWithinScope: baselineOrdinalWithinScope,
             forceMissing: sideChat,
           });
+      if (baselineCheckpoint !== null && baselineOrdinalWithinScope > 0) {
+        baselineCheckpoint =
+          previousCheckpoint?.runId != null && previousCheckpoint.appRunOrdinal != null
+            ? {
+                ...baselineCheckpoint,
+                ...previousCheckpoint,
+                summaryStatus: previousCheckpoint.summaryStatus ?? "missing",
+              }
+            : null;
+      }
       const checkpoint = yield* checkpoints.capture({
         scope,
         runId: run.id,
@@ -126,7 +143,12 @@ export const layer: Layer.Layer<
         appRunOrdinal: run.ordinal,
         capturedAt,
         forceMissing: sideChat,
+        compareWithPrevious:
+          hasReadyCheckpoint(baselineOrdinalWithinScope) || baselineCheckpoint !== null,
       });
+      if (baselineCheckpoint !== null && checkpoint.summaryStatus === "ready") {
+        baselineCheckpoint = { ...baselineCheckpoint, status: "ready" };
+      }
       // Omit delegatedCompletion to preserve cohort writes made after capture loaded the run.
       const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } = run;
       const commandId = CommandId.make(`command:effect:checkpoint.capture:${run.id}`);
@@ -256,7 +278,11 @@ function makeCheckpointTurnItem(input: {
   readonly checkpoint: OrchestrationV2Checkpoint;
   readonly completedAt: DateTime.Utc;
 }): OrchestrationV2TurnItem {
-  return {
+  const failed =
+    input.checkpoint.status === "error" ||
+    input.checkpoint.summaryStatus === "error" ||
+    input.checkpoint.summaryStatus === "missing";
+  const common = {
     id: input.idAllocator.derive.turnItemFromProviderItem({
       driver: input.providerThread.driver,
       nativeItemId: `checkpoint:${input.checkpoint.id}`,
@@ -269,11 +295,26 @@ function makeCheckpointTurnItem(input: {
     nativeItemRef: null,
     parentItemId: null,
     ordinal: input.run.ordinal * 100 + 99,
-    status: "completed",
+    status: failed ? ("failed" as const) : ("completed" as const),
     title: null,
     startedAt: input.completedAt,
     completedAt: input.completedAt,
     updatedAt: input.completedAt,
+  };
+  if (failed) {
+    return {
+      ...common,
+      type: "system_notice",
+      message:
+        input.checkpoint.status === "error"
+          ? "The checkpoint could not be captured. File changes and restore are unavailable for this run."
+          : input.checkpoint.summaryStatus === "missing"
+            ? "The checkpoint was saved, but its previous snapshot is unavailable. File changes could not be compared."
+            : "The checkpoint was saved, but its file summary could not be calculated.",
+    };
+  }
+  return {
+    ...common,
     type: "checkpoint",
     checkpointId: input.checkpoint.id,
     scopeId: input.checkpoint.scopeId,

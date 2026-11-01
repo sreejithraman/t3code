@@ -3,6 +3,7 @@ import type {
   CheckpointRef,
   CheckpointScopeId,
   MessageId,
+  OrchestrationV2Checkpoint,
   OrchestrationV2CheckpointFileTotals,
   OrchestrationV2ThreadProjection,
   RunId,
@@ -24,6 +25,7 @@ export interface ThreadCheckpointSummary {
     readonly deletions: number;
   }>;
   readonly filesTotal?: OrchestrationV2CheckpointFileTotals;
+  readonly summaryStatus?: OrchestrationV2Checkpoint["summaryStatus"];
   readonly assistantMessageId: MessageId | null;
   readonly completedAt: string;
 }
@@ -68,6 +70,9 @@ export function deriveThreadCheckpointSummaries(
         checkpointTurnCount: checkpoint.appRunOrdinal,
         checkpointRef: checkpoint.ref,
         status: checkpoint.status,
+        ...(checkpoint.summaryStatus === undefined
+          ? {}
+          : { summaryStatus: checkpoint.summaryStatus }),
         files: checkpoint.files,
         ...(checkpoint.filesTotal === undefined ? {} : { filesTotal: checkpoint.filesTotal }),
         assistantMessageId,

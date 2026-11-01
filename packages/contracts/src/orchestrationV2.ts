@@ -1391,6 +1391,7 @@ export const OrchestrationV2Checkpoint = Schema.Struct({
   appRunOrdinal: Schema.NullOr(PositiveInt),
   ref: CheckpointRef,
   status: Schema.Literals(["ready", "missing", "error", "stale"]),
+  summaryStatus: Schema.optionalKey(Schema.Literals(["ready", "missing", "error"])),
   files: Schema.Array(OrchestrationV2CheckpointFileSummary),
   filesTotal: Schema.optionalKey(OrchestrationV2CheckpointFileTotals),
   capturedAt: Schema.DateTimeUtc,

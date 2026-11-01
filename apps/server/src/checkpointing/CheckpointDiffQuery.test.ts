@@ -106,7 +106,7 @@ it.effect("excludes ready checkpoints from rolled-back runs", () => {
   }).pipe(Effect.provide(layer));
 });
 
-function makeProjectionAfterStoppedRun(stoppedRunCheckpoint: boolean) {
+function makeProjectionAfterStoppedRun(stoppedRunCheckpoint: boolean | "stale") {
   const thirdRunId = RunId.make("run:checkpoint-diff-v2:3");
   const checkpoint = (
     ordinalWithinScope: number,
@@ -122,7 +122,11 @@ function makeProjectionAfterStoppedRun(stoppedRunCheckpoint: boolean) {
   return {
     runs: [
       { id: firstRunId, ordinal: 1, status: "completed" },
-      { id: secondRunId, ordinal: 2, status: "interrupted" },
+      {
+        id: secondRunId,
+        ordinal: 2,
+        status: stoppedRunCheckpoint === "stale" ? "rolled_back" : "interrupted",
+      },
       { id: thirdRunId, ordinal: 3, status: "completed" },
     ],
     checkpointScopes: [
@@ -137,13 +141,16 @@ function makeProjectionAfterStoppedRun(stoppedRunCheckpoint: boolean) {
       },
       checkpoint(0, null),
       checkpoint(1, firstRunId),
-      checkpoint(2, stoppedRunCheckpoint ? secondRunId : null),
+      {
+        ...checkpoint(2, stoppedRunCheckpoint ? secondRunId : null),
+        status: stoppedRunCheckpoint === "stale" ? "stale" : "ready",
+      },
       checkpoint(3, thirdRunId),
     ],
   } satisfies ProjectionCheckpointContext;
 }
 
-it.effect.each([false, true])(
+it.effect.each([false, true, "stale"] as const)(
   "diffs the turn after a stopped run from its parent checkpoint (stopped run captured: %s)",
   (stoppedRunCheckpoint) => {
     const diffCheckpoints = vi.fn((_input: CheckpointStore.DiffCheckpointsInput) =>
@@ -156,9 +163,17 @@ it.effect.each([false, true])(
 
     return Effect.gen(function* () {
       const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
-      const result = yield* query.getTurnDiff({ threadId, fromTurnCount: 2, toTurnCount: 3 });
-
-      assert.strictEqual(result.diff, "diff --git a/file b/file");
+      if (stoppedRunCheckpoint === "stale") {
+        const error = yield* query
+          .getTurnDiff({ threadId, fromTurnCount: 2, toTurnCount: 3 })
+          .pipe(Effect.flip);
+        assert.instanceOf(error, CheckpointRefUnavailableError);
+        assert.equal(error.checkpoint, "from");
+        assert.deepEqual(diffCheckpoints.mock.calls, []);
+      } else {
+        const result = yield* query.getTurnDiff({ threadId, fromTurnCount: 2, toTurnCount: 3 });
+        assert.strictEqual(result.diff, "diff --git a/file b/file");
+      }
       yield* query.getTurnDiff({ threadId, fromTurnCount: 1, toTurnCount: 3 });
       yield* query.getFullThreadDiff({ threadId, toTurnCount: 3 });
       assert.deepEqual(
@@ -167,7 +182,9 @@ it.effect.each([false, true])(
           to: input.toCheckpointRef,
         })),
         [
-          { from: "refs/t3/test/ordinal/2", to: "refs/t3/test/ordinal/3" },
+          ...(stoppedRunCheckpoint === "stale"
+            ? []
+            : [{ from: "refs/t3/test/ordinal/2", to: "refs/t3/test/ordinal/3" }]),
           { from: "refs/t3/test/ordinal/1", to: "refs/t3/test/ordinal/3" },
           {
             from: yield* checkpointRefForScopeOrdinal({

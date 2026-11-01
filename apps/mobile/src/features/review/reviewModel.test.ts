@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
+import { CheckpointRef, RunId } from "@t3tools/contracts";
 
 import {
   applyReviewDiffMetadata,
   buildReviewParsedDiff,
+  buildReviewSectionItems,
   resolveReviewSelectedSectionId,
   type ReviewSectionItem,
 } from "./reviewModel";
@@ -30,6 +32,48 @@ describe("resolveReviewSelectedSectionId", () => {
     expect(resolveReviewSelectedSectionId([changes], "turn:2")).toBe("git:branch-range");
     expect(resolveReviewSelectedSectionId([turn, changes], "turn:2")).toBe("turn:2");
   });
+});
+
+it("keeps saved turns reviewable without reporting an unavailable comparison as zero files", () => {
+  const sections = buildReviewSectionItems({
+    checkpoints: (["missing", "error"] as const).map((summaryStatus, index) => ({
+      runId: RunId.make(`run:unavailable-${index}`),
+      checkpointTurnCount: index + 1,
+      checkpointRef: CheckpointRef.make(`refs/t3/unavailable-${index}`),
+      status: "ready" as const,
+      summaryStatus,
+      files: [],
+      assistantMessageId: null,
+      completedAt: "2026-11-01T00:00:00.000Z",
+    })),
+    gitSections: [],
+    turnDiffById: {},
+    loadingGitSections: false,
+  });
+  expect(sections.map((section) => section.subtitle)).toEqual([
+    "Diff unavailable",
+    "Diff unavailable",
+  ]);
+  const recovered = buildReviewSectionItems({
+    checkpoints: [
+      {
+        runId: RunId.make("run:recovered"),
+        checkpointTurnCount: 1,
+        checkpointRef: CheckpointRef.make("refs/t3/recovered"),
+        status: "ready",
+        summaryStatus: "error",
+        files: [],
+        assistantMessageId: null,
+        completedAt: "2026-11-01T00:00:00.000Z",
+      },
+    ],
+    gitSections: [],
+    turnDiffById: { "turn:1": "" },
+    loadingGitSections: false,
+  });
+  expect(recovered[0]?.subtitle).toBe("Compared with previous turn");
+  expect(buildReviewParsedDiff(null, "unavailable").kind).toBe("unavailable");
+  expect(buildReviewParsedDiff("", "empty-success").kind).toBe("empty");
 });
 
 describe("buildReviewParsedDiff", () => {

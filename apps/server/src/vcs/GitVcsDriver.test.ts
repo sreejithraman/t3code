@@ -4,6 +4,7 @@ import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -16,13 +17,23 @@ import { ChildProcessSpawner } from "effect/process";
 import * as Metric from "effect/Metric";
 import { assert, it } from "@effect/vitest";
 
-import { CheckpointRef, GitCommandError, VcsProcessExitError } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  GitCommandError,
+  NodeId,
+  ProviderThreadId,
+  RunId,
+  ThreadId,
+  VcsProcessExitError,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as ServerConfig from "../config.ts";
 import { gitCommandDuration, gitCommandsTotal } from "../observability/Metrics.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import * as CheckpointService from "../orchestration-v2/CheckpointService.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import type * as VcsDriver from "./VcsDriver.ts";
 import * as VcsDriverRegistry from "./VcsDriverRegistry.ts";
@@ -1111,6 +1122,249 @@ const vcsProcessSpawning = (command: string) =>
       VcsProcess.VcsProcess.of({ run: (input) => vcsProcess.run({ ...input, command }) }),
     ),
   ).pipe(Layer.provide(ProcessRunner.layer), Layer.provideMerge(NodeServices.layer));
+
+it.effect("GitVcsDriver distinguishes non-repositories from failed repository probes", () =>
+  Effect.gen(function* () {
+    for (const [stderr, nonRepository] of [
+      ["fatal: not a git repository (or any of the parent directories): .git\n", true],
+      [
+        "fatal: not a git repository (or any parent up to mount point /)\n" +
+          "Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+        true,
+      ],
+      [
+        "12:00:00 trace: built-in: git rev-parse --is-inside-work-tree\n" +
+          "fatal: not a git repository (or any of the parent directories): .git\n",
+        true,
+      ],
+      [
+        "warning: test warning\r\n" +
+          "fatal: not a git repository (or any parent up to mount point /)\r\n",
+        true,
+      ],
+      ["fatal: unable to access '/repo/.git/config': Operation not permitted\n", false],
+      ["fatal: bad config line 1 in file /repo/.git/config\n", false],
+      ["fatal: detected dubious ownership in repository at '/repo'\n", false],
+      ["warning: fatal: not a git repository (or any of the parent directories): .git\n", false],
+      ["fatal: not a git repository (or some unrelated failure)\n", false],
+    ] as const) {
+      const vcsProcess = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () =>
+            Effect.succeed({
+              code: ChildProcessSpawner.ExitCode(128),
+              stdout: "",
+              stderr,
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            }),
+        }),
+      );
+      const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+        Effect.provideService(VcsProcess.VcsProcess, vcsProcess),
+      );
+      const inside = yield* Effect.result(driver.isInsideWorkTree("/repo"));
+      const detected = yield* Effect.result(driver.detectRepository("/repo"));
+      if (nonRepository) {
+        assert.strictEqual(inside._tag, "Success");
+        assert.strictEqual(detected._tag, "Success");
+        if (inside._tag === "Success" && detected._tag === "Success") {
+          assert.strictEqual(inside.success, false);
+          assert.strictEqual(detected.success, null);
+        }
+      } else {
+        assert.strictEqual(inside._tag, "Failure");
+        assert.strictEqual(detected._tag, "Failure");
+        if (inside._tag === "Failure" && detected._tag === "Failure") {
+          assert.instanceOf(inside.failure, VcsProcessExitError);
+          assert.instanceOf(detected.failure, VcsProcessExitError);
+        }
+      }
+    }
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "checkpoint ref lookup distinguishes missing refs from Git failures through the store",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-checkpoint-ref-error-" });
+      const driver = yield* GitVcsDriver.makeVcsDriverShape();
+      yield* runGit(cwd, ["init"]);
+      const store = yield* makeCaptureStore(driver, cwd);
+      const input = { cwd, checkpointRef: CheckpointRef.make("refs/t3/checkpoints/missing") };
+      assert.isFalse(yield* store.hasCheckpointRef(input));
+      yield* fileSystem.writeFileString(path.join(cwd, ".git", "config"), "invalid config\n");
+      const result = yield* Effect.result(store.hasCheckpointRef(input));
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.instanceOf(result.failure, VcsProcessExitError);
+        assert.strictEqual(result.failure.exitCode, 128);
+      }
+    }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect(
+  "keeps captured snapshots restorable after baseline, ref or summary failures and recovers",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const liveProcess = yield* VcsProcess.VcsProcess;
+      for (const failureStage of ["baseline", "ref", "diff"] as const) {
+        const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-summary-recovery-" });
+        let failSummary = false;
+        const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+          Effect.provideService(VcsProcess.VcsProcess, {
+            run: (input) =>
+              liveProcess.run(
+                failSummary &&
+                  input.operation ===
+                    (failureStage === "baseline"
+                      ? VcsProcess.CHECKPOINT_CAPTURE_OPERATION
+                      : failureStage === "ref"
+                        ? "GitVcsDriver.checkpoints.resolveCheckpointCommit"
+                        : "GitVcsDriver.checkpoints.diffCheckpoints")
+                  ? { ...input, env: { ...input.env, GIT_CONFIG_COUNT: "invalid" } }
+                  : input,
+              ),
+          }),
+        );
+        yield* runGit(cwd, ["init"]);
+        const file = path.join(cwd, "file.txt");
+        yield* fileSystem.writeFileString(file, "initial\n");
+        const store = yield* makeCaptureStore(driver, cwd);
+        const checkpoints = yield* CheckpointService.CheckpointServiceV2.pipe(
+          Effect.provide(
+            CheckpointService.layer.pipe(
+              Layer.provide(IdAllocator.layer),
+              Layer.provide(Layer.succeed(CheckpointStore.CheckpointStore, store)),
+            ),
+          ),
+        );
+        const scope = yield* checkpoints.prepareRootRunScope({
+          threadId: ThreadId.make(`thread:summary-${failureStage}`),
+          runId: RunId.make(`run:summary-${failureStage}`),
+          rootNodeId: NodeId.make(`node:summary-${failureStage}`),
+          providerThreadId: ProviderThreadId.make(`provider-thread:summary-${failureStage}`),
+          cwd,
+          createdAt: yield* DateTime.now,
+        });
+        failSummary = failureStage === "baseline";
+        const baselineCapture = yield* Effect.result(
+          checkpoints.captureBaseline({ scope, ordinalWithinScope: 0 }),
+        );
+        assert.strictEqual(
+          baselineCapture._tag,
+          failureStage === "baseline" ? "Failure" : "Success",
+        );
+        yield* fileSystem.writeFileString(file, "changed\n");
+        failSummary = failureStage !== "baseline";
+        if (failureStage === "ref") {
+          const baseline = yield* checkpoints.materializeBaselineCheckpoint({
+            scope,
+            ordinalWithinScope: 0,
+          });
+          assert.strictEqual(baseline.status, "error");
+        }
+        const capture = (ordinalWithinScope: number) =>
+          checkpoints.capture({
+            scope,
+            runId: scope.runId,
+            nodeId: scope.nodeId!,
+            ordinalWithinScope,
+            appRunOrdinal: ordinalWithinScope,
+            capturedAt: scope.createdAt,
+          });
+        const failed = yield* capture(1);
+        assert.strictEqual(failed.status, "ready");
+        assert.strictEqual(failed.summaryStatus, failureStage === "baseline" ? "missing" : "error");
+        failSummary = false;
+        yield* fileSystem.writeFileString(file, "later\n");
+        yield* checkpoints.restore({ scope, checkpoint: failed });
+        assert.strictEqual(yield* fileSystem.readFileString(file), "changed\n");
+        yield* fileSystem.writeFileString(file, "recovered\n");
+        const recovered = yield* capture(2);
+        assert.strictEqual(recovered.summaryStatus, "ready");
+        assert.strictEqual(recovered.status, "ready");
+        assert.deepEqual(recovered.files, [
+          { path: "file.txt", kind: "modified", additions: 1, deletions: 1 },
+        ]);
+      }
+    }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
+
+it.effect("keeps snapshots restorable when an old discarded baseline cannot be trusted", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-discarded-baseline-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    const store = yield* makeCaptureStore(driver, cwd);
+    const checkpoints = yield* CheckpointService.CheckpointServiceV2.pipe(
+      Effect.provide(
+        CheckpointService.layer.pipe(
+          Layer.provide(IdAllocator.layer),
+          Layer.provide(Layer.succeed(CheckpointStore.CheckpointStore, store)),
+        ),
+      ),
+    );
+    const scope = yield* checkpoints.prepareRootRunScope({
+      threadId: ThreadId.make("thread:discarded-baseline"),
+      runId: RunId.make("run:discarded-baseline"),
+      rootNodeId: NodeId.make("node:discarded-baseline"),
+      providerThreadId: ProviderThreadId.make("provider-thread:discarded-baseline"),
+      cwd,
+      createdAt: yield* DateTime.now,
+    });
+    const capture = (ordinalWithinScope: number, compareWithPrevious = true) =>
+      checkpoints.capture({
+        scope,
+        runId: scope.runId,
+        nodeId: scope.nodeId!,
+        ordinalWithinScope,
+        appRunOrdinal: ordinalWithinScope,
+        capturedAt: scope.createdAt,
+        compareWithPrevious,
+      });
+    yield* checkpoints.captureBaseline({ scope, ordinalWithinScope: 0 });
+    const retained = yield* capture(1);
+    yield* fs.writeFileString(path.join(cwd, "discarded.txt"), "discarded\n");
+    const discarded = yield* capture(2);
+    const discardedCommit = (yield* git(["rev-parse", discarded.ref])).stdout;
+    yield* checkpoints.restore({ scope, checkpoint: retained });
+    assert.isFalse(yield* fs.exists(path.join(cwd, "discarded.txt")));
+    yield* checkpoints.captureBaseline({ scope, ordinalWithinScope: 2 });
+    assert.strictEqual((yield* git(["rev-parse", discarded.ref])).stdout, discardedCommit);
+    assert.notEqual(
+      (yield* git(["rev-parse", `${discarded.ref}^{tree}`])).stdout,
+      (yield* git(["rev-parse", `${retained.ref}^{tree}`])).stdout,
+    );
+    yield* fs.writeFileString(path.join(cwd, "next.txt"), "next\n");
+
+    const next = yield* capture(3, false);
+
+    assert.strictEqual(next.status, "ready");
+    assert.strictEqual(next.summaryStatus, "missing");
+    assert.deepEqual(next.files, []);
+    yield* fs.writeFileString(path.join(cwd, "next.txt"), "later edit\n");
+    yield* checkpoints.restore({ scope, checkpoint: next });
+    assert.strictEqual(yield* fs.readFileString(path.join(cwd, "next.txt")), "next\n");
+    assert.isFalse(yield* fs.exists(path.join(cwd, "discarded.txt")));
+    yield* fs.writeFileString(path.join(cwd, "later.txt"), "later\n");
+    const recovered = yield* capture(4);
+    assert.strictEqual(recovered.summaryStatus, "ready");
+    assert.deepEqual(recovered.files, [
+      { path: "later.txt", kind: "modified", additions: 1, deletions: 0 },
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(layerGitContract)),
+);
 
 it.effect("GitVcsDriver treats a missing git executable as outside any repository", () =>
   Effect.gen(function* () {

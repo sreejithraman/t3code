@@ -813,7 +813,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
                   <AppActivityIndicator size="small" />
                   <Text className="text-xs text-foreground-muted">Loading diff…</Text>
                 </View>
-              ) : parsedDiff.kind === "empty" ? (
+              ) : parsedDiff.kind === "empty" || parsedDiff.kind === "unavailable" ? (
                 <View
                   className={
                     Platform.OS === "android"
@@ -821,14 +821,18 @@ export function ReviewSheet(props: ReviewSheetProps) {
                       : "border-b border-border bg-card px-4 py-5"
                   }
                 >
-                  <Text className="text-sm font-t3-bold text-foreground">No changes</Text>
+                  <Text className="text-sm font-t3-bold text-foreground">
+                    {parsedDiff.kind === "unavailable" ? "Diff unavailable" : "No changes"}
+                  </Text>
                   <Text
                     className={cn(
                       "text-xs leading-normal text-foreground-muted",
                       Platform.OS === "android" && "mt-2 text-center",
                     )}
                   >
-                    {selectedSection.subtitle ?? "This diff is empty."}
+                    {parsedDiff.kind === "unavailable"
+                      ? "This comparison could not be loaded."
+                      : (selectedSection.subtitle ?? "This diff is empty.")}
                   </Text>
                 </View>
               ) : parsedDiff.kind === "raw" ? (

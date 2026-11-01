@@ -15,6 +15,7 @@ import { useSelectedThreadProjection } from "../../state/use-thread-detail";
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import {
   buildReviewSectionItems,
+  buildReviewTurnSection,
   getReadyReviewCheckpoints,
   getReviewSectionIdForCheckpoint,
   resolveReviewSelectedSectionId,
@@ -110,12 +111,12 @@ export function useReviewSections(input: {
 
   const reviewSections = cachedSections.map((section): ReviewSectionItem => {
     if (section.kind === "turn") {
-      return section.id === activeSectionId
-        ? {
-            ...section,
-            diff: activeTurnDiff.data?.diff ?? section.diff,
-            isLoading: activeTurnDiff.isPending,
-          }
+      return section.id === activeSectionId && activeCheckpoint !== null
+        ? buildReviewTurnSection(
+            activeCheckpoint,
+            activeTurnDiff.data?.diff ?? section.diff ?? undefined,
+            activeTurnDiff.isPending,
+          )
         : section;
     }
     // Keep the selected section while its grant loads, without displaying cached host files.

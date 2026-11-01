@@ -6,13 +6,16 @@ import {
   NodeId,
   RunId,
   ThreadId,
-  type OrchestrationV2Checkpoint,
+  OrchestrationV2Checkpoint,
   type OrchestrationV2ConversationMessage,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { deriveThreadCheckpointSummaries } from "./threadCheckpoints.ts";
+
+const decodeCheckpoint = Schema.decodeSync(OrchestrationV2Checkpoint);
 
 function checkpoint(
   run: string,
@@ -58,6 +61,15 @@ function message(
 }
 
 describe("deriveThreadCheckpointSummaries", () => {
+  it("preserves unavailable summaries independently from restorable snapshots after decoding", () => {
+    const persisted = decodeCheckpoint({
+      ...checkpoint("failed-summary"),
+      summaryStatus: "error",
+    });
+    const [summary] = deriveThreadCheckpointSummaries({ checkpoints: [persisted], messages: [] });
+    expect(summary).toMatchObject({ status: "ready", summaryStatus: "error", files: [] });
+  });
+
   it("preserves checkpoint order, status, file references and ISO dates while filtering null keys", () => {
     const files = Object.freeze([
       { path: "src/one.ts", kind: "modified", additions: 10, deletions: 2 },

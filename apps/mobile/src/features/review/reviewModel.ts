@@ -88,6 +88,9 @@ export type ReviewFilePreviewState =
 
 export type ReviewParsedDiff =
   | {
+      readonly kind: "unavailable";
+    }
+  | {
       readonly kind: "empty";
     }
   | {
@@ -109,10 +112,16 @@ function checkpointTitle(checkpoint: ThreadCheckpointSummary): string {
   return `Turn ${checkpoint.checkpointTurnCount}`;
 }
 
-function checkpointSubtitle(checkpoint: ThreadCheckpointSummary): string {
+function checkpointSubtitle(
+  checkpoint: ThreadCheckpointSummary,
+  comparisonAvailable: boolean,
+): string {
   const fileCount = checkpointFileTotals(checkpoint).count;
   if (checkpoint.status !== "ready") {
     return `Diff ${checkpoint.status}`;
+  }
+  if (checkpoint.summaryStatus === "missing" || checkpoint.summaryStatus === "error") {
+    return comparisonAvailable ? "Compared with previous turn" : "Diff unavailable";
   }
   return `${fileCount} file${fileCount === 1 ? "" : "s"} changed`;
 }
@@ -514,24 +523,33 @@ export function reviewTurnDiffsBySectionId(
   );
 }
 
+export function buildReviewTurnSection(
+  checkpoint: ThreadCheckpointSummary,
+  diff: string | undefined,
+  isLoading: boolean,
+): ReviewSectionItem {
+  return {
+    id: getReviewSectionIdForCheckpoint(checkpoint),
+    kind: "turn",
+    title: checkpointTitle(checkpoint),
+    subtitle: checkpointSubtitle(checkpoint, diff !== undefined),
+    diff: diff ?? null,
+    isLoading,
+  };
+}
+
 export function buildReviewSectionItems(input: {
   readonly checkpoints: ReadonlyArray<ThreadCheckpointSummary>;
   readonly gitSections: ReadonlyArray<ReviewDiffPreviewSource>;
   readonly turnDiffById: Readonly<Record<string, string | undefined>>;
   readonly loadingGitSections: boolean;
 }): ReadonlyArray<ReviewSectionItem> {
-  const turnItems = getReadyReviewCheckpoints(input.checkpoints).map<ReviewSectionItem>(
-    (checkpoint) => {
-      const id = getReviewSectionIdForCheckpoint(checkpoint);
-      return {
-        id,
-        kind: "turn",
-        title: checkpointTitle(checkpoint),
-        subtitle: checkpointSubtitle(checkpoint),
-        diff: input.turnDiffById[id] ?? null,
-        isLoading: false,
-      };
-    },
+  const turnItems = getReadyReviewCheckpoints(input.checkpoints).map((checkpoint) =>
+    buildReviewTurnSection(
+      checkpoint,
+      input.turnDiffById[getReviewSectionIdForCheckpoint(checkpoint)],
+      false,
+    ),
   );
 
   const gitItems = input.gitSections
@@ -593,9 +611,8 @@ export function buildReviewParsedDiff(
   diff: string | null | undefined,
   cacheScope: string,
 ): ReviewParsedDiff {
-  if (!diff?.trim()) {
-    return { kind: "empty" };
-  }
+  if (diff == null) return { kind: "unavailable" };
+  if (!diff.trim()) return { kind: "empty" };
 
   const { text, truncated } = splitTruncationMarker(diff);
   if (text.length === 0) {
@@ -666,7 +683,7 @@ export function applyReviewDiffMetadata(
   previewDiff: ReviewParsedDiff,
   selectedSection: Pick<ReviewSectionItem, "files" | "truncated"> | null,
 ): ReviewParsedDiff {
-  if (previewDiff.kind === "empty") return previewDiff;
+  if (previewDiff.kind === "empty" || previewDiff.kind === "unavailable") return previewDiff;
   const notice = selectedSection?.truncated
     ? `This preview exceeds the size limit. Changes shown are incomplete.${selectedSection.files ? " Counts include all changes." : ""}`
     : previewDiff.notice;
